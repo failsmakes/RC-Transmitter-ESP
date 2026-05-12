@@ -4,12 +4,20 @@
 //  Donanım:
 //    • Arduino joystick modülü (X=Yön, Y=Gaz) — analog MUX ile A0'dan okunur
 //    • Potansiyometre veya butonlar — Trim
-//    • ESP-NOW → Receiver'a gönderir
-//    • ESP-NOW ← Receiver'dan ACK/telemetri alır
+//    • Potansiyometre (opsiyonel) — Gyro Gain
+//    • Buton (opsiyonel) — Gyro Direction Reverse
+//    • ESP-NOW → Receiver'a RCPacket gönderir
+//    • ESP-NOW ← Receiver'dan TelemetryPacket (ACK + gyro durumu) alır
 //
-//  Startup kalibrasyonu:
-//    İlk açılışta joystick orta değerleri ADC'den otomatik öğrenilir.
-//    Joystickleri boşta bırakın — LED 3 kez yanıp söner, sonra hazır.
+//  RCPacket yapısı:
+//    throttle : -100..+100
+//    steer    : -100..+100 (trim dahil)
+//    seq      : paket sayacı
+//    gyroGain : 0–100
+//    gyroDir  : +1 veya -1
+//
+//  Serial çıkış (115200 baud):
+//    TX → t / ack_t  s / ack_s  trim  gain  dir  seq / ack_seq  bağlantı durumu
 // =============================================================================
 
 #include <Arduino.h>
@@ -18,20 +26,24 @@
 #include "config.h"
 
 // -----------------------------------------------------------------------------
-//  ORTAK VERİ YAPILARI
+//  VERİ YAPILARI  (Receiver ile aynı olmalı!)
 // -----------------------------------------------------------------------------
 struct __attribute__((packed)) RCPacket {
   int8_t  throttle;
   int8_t  steer;
   uint8_t seq;
+  int8_t  gyroGain;   // 0–100
+  int8_t  gyroDir;    // +1 veya -1
 };
 
 struct __attribute__((packed)) TelemetryPacket {
   uint8_t ack_seq;
-  int8_t  ack_throttle;   // -100 … +100
-  int8_t  ack_steer;      // -100 … +100
-  float   ack_vBat;      // pil voltajı
+  int8_t  ack_throttle;
+  int8_t  ack_steer;
+  float   ack_vBat;
   uint8_t ack_rssi;
+  int8_t  ack_gyroGain;
+  int8_t  ack_gyroDir;
 };
 
 // -----------------------------------------------------------------------------
@@ -39,16 +51,17 @@ struct __attribute__((packed)) TelemetryPacket {
 // -----------------------------------------------------------------------------
 uint8_t  rxMac[6]      = RX_MAC;
 uint8_t  seqCounter    = 0;
-uint8_t  lastAckSeq    = 0;
 uint32_t lastAckMs     = 0;
 bool     rxConnected   = false;
 
-// Joystick kalibrasyon (startup'ta ölçülür)
 int joyThrottleCenter = 512;
 int joySteerCenter    = 512;
 
-// Trim
-int trimValue = 0;
+int  trimValue  = 0;
+int  gyroGain   = GYRO_GAIN_FIXED;
+int  gyroDir    = GYRO_DIR_FIXED;
+
+TelemetryPacket lastTelemetry = {};
 
 #if TRIM_SOURCE == TRIM_SOURCE_BUTTONS
 uint32_t lastTrimMs = 0;
@@ -69,28 +82,36 @@ void ledBlink(int n, int ms = 150) {
 
 // -----------------------------------------------------------------------------
 //  MUX OKUMA
-//  sel1=LOW,  sel2=LOW  → Kanal 0 = Gaz (Joystick Y)
-//  sel1=HIGH, sel2=LOW  → Kanal 1 = Yön (Joystick X)
-//  sel1=LOW,  sel2=HIGH → Kanal 2 = Trim Pot
+//  Kanal → SEL pinleri: sel1=bit0, sel2=bit1, sel3=bit2
+//    0: Gaz  (sel1=0, sel2=0, sel3=0)
+//    1: Yön  (sel1=1, sel2=0, sel3=0)
+//    2: Trim Pot (sel1=0, sel2=1, sel3=0)
+//    3: Gyro Gain Pot (sel1=1, sel2=1, sel3=0) — sel3 gerekirse ayrı pin
 // -----------------------------------------------------------------------------
 int readMuxChannel(int ch) {
-  // ch: 0=Gaz, 1=Yön, 2=Trim
   bool sel1 = (ch & 0x01) != 0;
   bool sel2 = (ch & 0x02) != 0;
   digitalWrite(MUX_SEL_PIN, sel1 ? HIGH : LOW);
 #if TRIM_SOURCE == TRIM_SOURCE_POT
   digitalWrite(MUX_SEL2_PIN, sel2 ? HIGH : LOW);
 #endif
-  delayMicroseconds(50);   // MUX yerleşme süresi
+#if GYRO_GAIN_SOURCE_POT
+  // sel3 için ek pin (MUX_SEL3_PIN) — kanal 3'te gyro gain pot okunur
+  bool sel3 = (ch & 0x04) != 0;
+  // sel3 pini varsa buraya ekle:
+  // digitalWrite(MUX_SEL3_PIN, sel3 ? HIGH : LOW);
+  (void)sel3;
+#endif
+  delayMicroseconds(50);
   return analogRead(ADC_PIN);
 }
 
 // -----------------------------------------------------------------------------
 //  JOYSTICK → -100..+100
 // -----------------------------------------------------------------------------
-int readJoystick(int kanal = 0) {
-  int raw = readMuxChannel(kanal);
-  int center = joyThrottleCenter;
+int readJoystick(int kanal) {
+  int raw    = readMuxChannel(kanal);
+  int center = (kanal == 0) ? joyThrottleCenter : joySteerCenter;
   int val;
   if (raw >= center) {
     val = map(raw, center, JOY_ADC_MAX, 0, 100);
@@ -107,8 +128,7 @@ int readJoystick(int kanal = 0) {
 // -----------------------------------------------------------------------------
 void updateTrim() {
 #if TRIM_SOURCE == TRIM_SOURCE_POT
-  int raw = readMuxChannel(2);
-  // Pot orta = trim 0, tam sola = TRIM_MIN, tam sağa = TRIM_MAX
+  int raw   = readMuxChannel(2);
   trimValue = map(raw, JOY_ADC_MIN, JOY_ADC_MAX, TRIM_MIN, TRIM_MAX);
   trimValue = constrain(trimValue, TRIM_MIN, TRIM_MAX);
 
@@ -125,26 +145,44 @@ void updateTrim() {
 }
 
 // -----------------------------------------------------------------------------
-//  ESP-NOW gönderim callback
+//  GYRO GAIN OKUMA
+// -----------------------------------------------------------------------------
+void updateGyroGain() {
+#if GYRO_GAIN_SOURCE_POT
+  // MUX kanal 3'ten pot oku
+  int raw = readMuxChannel(3);
+  gyroGain = map(raw, JOY_ADC_MIN, JOY_ADC_MAX, 0, 100);
+  gyroGain = constrain(gyroGain, 0, 100);
+#else
+  gyroGain = GYRO_GAIN_FIXED;
+#endif
+}
+
+// -----------------------------------------------------------------------------
+//  GYRO DIRECTION OKUMA
+// -----------------------------------------------------------------------------
+void updateGyroDir() {
+#if GYRO_DIR_BTN_ENABLED
+  // Buton basılıyken yön ters
+  gyroDir = (digitalRead(GYRO_DIR_BTN_PIN) == LOW) ? -1 : 1;
+#else
+  gyroDir = GYRO_DIR_FIXED;
+#endif
+}
+
+// -----------------------------------------------------------------------------
+//  ESP-NOW CALLBACK'LER
 // -----------------------------------------------------------------------------
 void onSendCB(uint8_t* mac, uint8_t status) {
-  // status 0 = başarılı delivery
   if (status == 0) ledOn();
   else             ledOff();
 }
 
-// -----------------------------------------------------------------------------
-//  ESP-NOW alma callback (telemetri / ACK)
-// -----------------------------------------------------------------------------
-
-TelemetryPacket tp;
-
 void onRecvCB(uint8_t* mac, uint8_t* data, uint8_t len) {
   if (len != sizeof(TelemetryPacket)) return;
-  memcpy(&tp, data, sizeof(tp));
-  lastAckSeq   = tp.ack_seq;
-  lastAckMs    = millis();
-  rxConnected  = true;
+  memcpy(&lastTelemetry, data, sizeof(lastTelemetry));
+  lastAckMs   = millis();
+  rxConnected = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -154,7 +192,6 @@ void calibrateJoystick() {
   Serial.println("[CAL] Joystick kalibrasyonu — boşta bırakın...");
   ledBlink(1, 500);
 
-  // 10 örnek ortalaması
   long sumT = 0, sumS = 0;
   for (int i = 0; i < 10; i++) {
     sumT += readMuxChannel(0);
@@ -190,17 +227,17 @@ void setup() {
   pinMode(TRIM_BTN_RESET_PIN, INPUT_PULLUP);
 #endif
 
-  // WiFi station modu (ESP-NOW için gerekli, gerçek AP'ye bağlanmayacak)
+#if GYRO_DIR_BTN_ENABLED
+  pinMode(GYRO_DIR_BTN_PIN, INPUT_PULLUP);
+#endif
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
 
-  // MAC adresini yazdır (receiver config.h'a yazılacak)
   Serial.printf("[TX] MAC: %s\n", WiFi.macAddress().c_str());
 
-  // Joystick kalibrasyon
   calibrateJoystick();
 
-  // ESP-NOW başlat
   if (esp_now_init() != 0) {
     Serial.println("[ESP-NOW] Init HATA — yeniden başlatılıyor");
     ledBlink(10, 50);
@@ -209,8 +246,6 @@ void setup() {
   esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
   esp_now_register_send_cb(onSendCB);
   esp_now_register_recv_cb(onRecvCB);
-
-  // Receiver peer ekle
   esp_now_add_peer(rxMac, ESP_NOW_ROLE_COMBO, ESPNOW_CHANNEL, NULL, 0);
 
   Serial.println("[TX] Hazır — gönderim başlıyor.");
@@ -226,32 +261,40 @@ static uint32_t lastLedMs  = 0;
 void loop() {
   uint32_t now = millis();
 
-  // --- Trim güncelle ---
+  // Trim, Gyro Gain, Gyro Dir güncelle
   updateTrim();
+  updateGyroGain();
+  updateGyroDir();
 
-  // --- Belirli aralıkta gönder ---
   if (now - lastSendMs >= SEND_INTERVAL_MS) {
     lastSendMs = now;
 
     RCPacket pkt;
     pkt.throttle = (int8_t) readJoystick(0);
-    pkt.steer    = (int8_t) constrain((int8_t) readJoystick(1) + (int8_t) trimValue, -100, 100);
+    pkt.steer    = (int8_t) constrain(readJoystick(1) + trimValue, -100, 100);
     pkt.seq      = ++seqCounter;
+    pkt.gyroGain = (int8_t) gyroGain;
+    pkt.gyroDir  = (int8_t) gyroDir;
 
     esp_now_send(rxMac, (uint8_t*)&pkt, sizeof(pkt));
 
-    Serial.printf("TX → t:%4d / %4d  s:%4d / %4d  trim:%3d  seq:%3d / %3d  %s\n",
-      pkt.throttle, tp.ack_throttle, pkt.steer, tp.ack_steer, (int8_t) trimValue, 
-      pkt.seq,tp.ack_seq, rxConnected ? "ACK✓" : "---");
+    Serial.printf(
+      "TX → t:%4d/%4d  s:%4d/%4d  trim:%3d  gain:%3d  dir:%+2d  seq:%3d/%3d  %s\n",
+      (int)pkt.throttle, (int)lastTelemetry.ack_throttle,
+      (int)pkt.steer,    (int)lastTelemetry.ack_steer,
+      trimValue, gyroGain, gyroDir,
+      (int)pkt.seq, (int)lastTelemetry.ack_seq,
+      rxConnected ? "ACK✓" : "---"
+    );
   }
 
-  // --- Bağlantı kontrolü: 1 sn ACK gelmezse bağlantı yok ---
+  // Bağlantı kontrolü
   if (rxConnected && (now - lastAckMs > 1000)) {
     rxConnected = false;
     Serial.println("[TX] Receiver yanıt vermiyor!");
   }
 
-  // --- LED: bağlı → hızlı yanıp sönme, değil → yavaş ---
+  // LED: bağlı → hızlı, değil → yavaş yanıp sönme
   if (now - lastLedMs > (rxConnected ? 100 : 500)) {
     lastLedMs = now;
     digitalWrite(STATUS_LED_PIN, !digitalRead(STATUS_LED_PIN));
